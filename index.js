@@ -29,7 +29,7 @@ const {
 const { DISCORD_TOKEN, GUILD_ID, YTDLP_PATH = 'yt-dlp', PORT = 3000 } = process.env;
 
 if (!DISCORD_TOKEN) {
-  console.error('Missing DISCORD_TOKEN in environment.');
+  console.error('Missing DISCORD_TOKEN in environment variables.');
   process.exit(1);
 }
 
@@ -69,7 +69,7 @@ const client = new Client({
 });
 
 /* ------------------------------------------------------------------ */
-/* Slash Command Definitions                                          */
+/* Slash Commands Definition                                          */
 /* ------------------------------------------------------------------ */
 const commands = [
   new SlashCommandBuilder()
@@ -81,7 +81,7 @@ const commands = [
   new SlashCommandBuilder().setName('skip').setDescription('Skip the current song'),
   new SlashCommandBuilder().setName('pause').setDescription('Pause playback'),
   new SlashCommandBuilder().setName('resume').setDescription('Resume playback'),
-  new SlashCommandBuilder().setName('stop').setDescription('Stop playback and leave voice'),
+  new SlashCommandBuilder().setName('stop').setDescription('Stop playback, clear queue and leave'),
   new SlashCommandBuilder().setName('queue').setDescription('Show the current song queue'),
   new SlashCommandBuilder().setName('nowplaying').setDescription('Show current song information'),
   new SlashCommandBuilder().setName('shuffle').setDescription('Shuffle the upcoming queue'),
@@ -93,7 +93,7 @@ const commands = [
     ),
   new SlashCommandBuilder()
     .setName('loop')
-    .setDescription('Set loop mode')
+    .setDescription('Set queue loop mode')
     .addStringOption((o) =>
       o
         .setName('mode')
@@ -120,7 +120,7 @@ async function registerCommands() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Track Resolvers & Search Sanitizers                                */
+/* Helpers & Resolvers                                                */
 /* ------------------------------------------------------------------ */
 const queues = new Map();
 const isUrl = (s) => /^https?:\/\//i.test(s);
@@ -138,7 +138,7 @@ function cleanTitle(title) {
   return title
     .replace(/[\(\[\{].*?[\)\]\}]/gi, '') // Remove (Slowed), [Official Video], etc.
     .replace(/[xX×]\s+[A-Za-z0-9_]+/g, '') // Remove featured artist additions
-    .replace(/[^\w\s-]/gi, '') // Remove symbols that break queries
+    .replace(/[^\w\s-]/gi, '') // Remove punctuation that breaks exact searches
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -200,7 +200,7 @@ function runYtDlpInfo(target) {
     let err = '';
     proc.stdout.on('data', (d) => (out += d));
     proc.stderr.on('data', (d) => (err += d));
-    proc.on('error', (e) => reject(new Error(`yt-dlp spawn failed: ${e.message}`)));
+    proc.on('error', (e) => reject(new Error(`yt-dlp spawn failure: ${e.message}`)));
     proc.on('close', (code) => {
       const line = out.split('\n').find((l) => l.trim().startsWith('{'));
       if (code !== 0 || !line) return reject(new Error(err.trim() || 'No audio sources found'));
@@ -224,14 +224,15 @@ async function resolveTrack(query) {
   let targetQuery = query;
   let customThumbnail = null;
 
-  // 1. Spotify URLs
+  // 1. Intercept Spotify URLs via oEmbed
   if (isUrl(query) && isSpotifyUrl(query)) {
     try {
       const meta = await spotifyMetaViaOembed(query);
       targetQuery = meta.title;
       customThumbnail = meta.thumbnail;
+      console.log(`Resolved Spotify track: "${targetQuery}"`);
     } catch (e) {
-      console.error(`Spotify resolution error: ${e.message}`);
+      console.error(`Spotify oEmbed failed: ${e.message}`);
     }
   }
 
@@ -242,12 +243,12 @@ async function resolveTrack(query) {
     } catch (directErr) {
       console.error(`Direct YouTube lookup blocked: ${directErr.message}`);
 
-      // Bypass bot wall: Grab title with oEmbed, then fuzzy search SoundCloud
+      // Bypass datacenter bot challenge: fetch metadata via oEmbed, then search SoundCloud
       let oembed;
       try {
         oembed = await youtubeMetaViaOembed(targetQuery);
       } catch {
-        throw new Error('Unable to extract metadata from that YouTube URL.');
+        throw new Error('Could not resolve YouTube metadata.');
       }
 
       const stripped = cleanTitle(oembed.title);
@@ -261,18 +262,20 @@ async function resolveTrack(query) {
       for (const term of attempts) {
         if (!term) continue;
         try {
+          console.log(`Trying SoundCloud match for: "${term}"`);
           const track = await runYtDlpInfo(`scsearch1:${term}`);
-          track.title = oembed.title; // Retain original track title
+          track.title = oembed.title; // Keep original song title
           track.thumbnail = oembed.thumbnail || track.thumbnail;
           track.note = 'Resolved via SoundCloud audio mirror.';
           return track;
         } catch {}
       }
-      throw new Error('YouTube is blocked on this host, and no SoundCloud match was found.');
+
+      throw new Error('YouTube is blocked on this datacenter IP and no fallback source was found.');
     }
   }
 
-  // 3. General Queries: SoundCloud first to avoid datacenter blocks, then YouTube
+  // 3. Regular Queries & Searches (SoundCloud first to avoid IP bot blocks)
   const searchTargets = isUrl(targetQuery)
     ? [targetQuery]
     : [`scsearch1:${targetQuery}`, `ytsearch1:${targetQuery}`];
@@ -306,7 +309,7 @@ function trackEmbed(title, track, extra) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Voice Connection & High-Fidelity Audio Pipeline                     */
+/* Voice Connection & Stable Transcoding Pipeline                     */
 /* ------------------------------------------------------------------ */
 async function createGuildQueue(interaction, voiceChannel) {
   const connection = joinVoiceChannel({
@@ -405,7 +408,7 @@ function playNext(gq, announce) {
   if (!next) {
     gq.current = null;
     gq.leaveTimer = setTimeout(() => {
-      gq.textChannel?.send('Queue finished. Disconnecting from voice.').catch(() => {});
+      gq.textChannel?.send('Queue finished. Leaving the voice channel.').catch(() => {});
       destroyQueue(gq.guildId);
     }, 120_000);
     return;
@@ -413,12 +416,11 @@ function playNext(gq, announce) {
 
   gq.current = next;
 
-  // 1. Fetch best available audio stream
+  // Spawn yt-dlp to output raw audio
   const ytProc = spawn(
     YTDLP_PATH,
     [
-      '-f', 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
-      '--audio-quality', '0',
+      '-f', 'bestaudio/best',
       '-o', '-',
       '-q',
       '--no-warnings',
@@ -430,7 +432,7 @@ function playNext(gq, announce) {
   );
   gq.ytProc = ytProc;
 
-  // 2. High-Fidelity Transcoding with SoX 32-bit Resampler & Subtle Presence EQ
+  // Transcode cleanly to 48kHz Stereo 16-bit PCM for Discord
   const ffmpegBin = ffmpegPath || 'ffmpeg';
   const ffmpegProc = spawn(
     ffmpegBin,
@@ -438,7 +440,6 @@ function playNext(gq, announce) {
       '-analyzeduration', '0',
       '-loglevel', '0',
       '-i', 'pipe:0',
-      '-af', 'aresample=48000:resampler=soxr:precision=28,equalizer=f=64:t=q:w=1:g=2,equalizer=f=12000:t=q:w=1:g=1.5',
       '-f', 's16le',
       '-ar', '48000',
       '-ac', '2',
@@ -453,7 +454,6 @@ function playNext(gq, announce) {
   ytProc.on('error', (e) => console.error('yt-dlp stream error:', e.message));
   ffmpegProc.on('error', (e) => console.error('FFmpeg transcode error:', e.message));
 
-  // 3. Audio Resource Initialization
   const resource = createAudioResource(ffmpegProc.stdout, {
     inputType: StreamType.Raw,
     inlineVolume: true,
