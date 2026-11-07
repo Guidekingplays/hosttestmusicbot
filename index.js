@@ -29,7 +29,7 @@ const {
 const { DISCORD_TOKEN, GUILD_ID, YTDLP_PATH = 'yt-dlp', PORT = 3000 } = process.env;
 
 if (!DISCORD_TOKEN) {
-  console.error('Missing DISCORD_TOKEN in environment variables.');
+  console.error('Missing DISCORD_TOKEN in environment.');
   process.exit(1);
 }
 
@@ -40,7 +40,7 @@ const ytExtraArgs = [
   '--force-ipv4',
   '--no-check-certificates',
   '--extractor-args',
-  'youtube:player_client=tv_embedded,mweb,web_creator',
+  'youtube:player_client=tv_embedded,web_creator,mweb;player_skip=configs',
 ];
 
 if (process.env.YT_COOKIES_B64) {
@@ -69,7 +69,7 @@ const client = new Client({
 });
 
 /* ------------------------------------------------------------------ */
-/* Slash Commands Definition                                          */
+/* Slash Command Definitions                                          */
 /* ------------------------------------------------------------------ */
 const commands = [
   new SlashCommandBuilder()
@@ -81,7 +81,7 @@ const commands = [
   new SlashCommandBuilder().setName('skip').setDescription('Skip the current song'),
   new SlashCommandBuilder().setName('pause').setDescription('Pause playback'),
   new SlashCommandBuilder().setName('resume').setDescription('Resume playback'),
-  new SlashCommandBuilder().setName('stop').setDescription('Stop playback, clear queue and leave'),
+  new SlashCommandBuilder().setName('stop').setDescription('Stop playback and leave voice'),
   new SlashCommandBuilder().setName('queue').setDescription('Show the current song queue'),
   new SlashCommandBuilder().setName('nowplaying').setDescription('Show current song information'),
   new SlashCommandBuilder().setName('shuffle').setDescription('Shuffle the upcoming queue'),
@@ -93,7 +93,7 @@ const commands = [
     ),
   new SlashCommandBuilder()
     .setName('loop')
-    .setDescription('Set queue loop mode')
+    .setDescription('Set loop mode')
     .addStringOption((o) =>
       o
         .setName('mode')
@@ -120,7 +120,7 @@ async function registerCommands() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Helpers & Resolvers                                                */
+/* Track Resolvers & Search Sanitizers                                */
 /* ------------------------------------------------------------------ */
 const queues = new Map();
 const isUrl = (s) => /^https?:\/\//i.test(s);
@@ -132,6 +132,15 @@ function fmtDuration(sec) {
   const s = Math.floor(sec % 60);
   const mm = h ? String(m).padStart(2, '0') : String(m);
   return `${h ? h + ':' : ''}${mm}:${String(s).padStart(2, '0')}`;
+}
+
+function cleanTitle(title) {
+  return title
+    .replace(/[\(\[\{].*?[\)\]\}]/gi, '') // Remove (Slowed), [Official Video], etc.
+    .replace(/[xX×]\s+[A-Za-z0-9_]+/g, '') // Remove featured artist additions
+    .replace(/[^\w\s-]/gi, '') // Remove symbols that break queries
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function isSpotifyUrl(u) {
@@ -191,7 +200,7 @@ function runYtDlpInfo(target) {
     let err = '';
     proc.stdout.on('data', (d) => (out += d));
     proc.stderr.on('data', (d) => (err += d));
-    proc.on('error', (e) => reject(new Error(`yt-dlp spawn failure: ${e.message}`)));
+    proc.on('error', (e) => reject(new Error(`yt-dlp spawn failed: ${e.message}`)));
     proc.on('close', (code) => {
       const line = out.split('\n').find((l) => l.trim().startsWith('{'));
       if (code !== 0 || !line) return reject(new Error(err.trim() || 'No audio sources found'));
@@ -200,7 +209,6 @@ function runYtDlpInfo(target) {
         resolve({
           title: j.title,
           url: j.webpage_url || j.url,
-          streamUrl: j.url,
           duration: j.duration,
           thumbnail: j.thumbnail,
           author: j.uploader || j.channel,
@@ -216,44 +224,55 @@ async function resolveTrack(query) {
   let targetQuery = query;
   let customThumbnail = null;
 
-  // 1. Handle Spotify links
+  // 1. Spotify URLs
   if (isUrl(query) && isSpotifyUrl(query)) {
     try {
       const meta = await spotifyMetaViaOembed(query);
       targetQuery = meta.title;
       customThumbnail = meta.thumbnail;
     } catch (e) {
-      console.error(`Spotify oEmbed failed: ${e.message}`);
+      console.error(`Spotify resolution error: ${e.message}`);
     }
   }
 
-  // 2. Handle YouTube Links directly
+  // 2. Direct YouTube Links
   if (isUrl(targetQuery) && isYouTubeUrl(targetQuery)) {
-    // Try streaming directly first
     try {
-      const track = await runYtDlpInfo(targetQuery);
-      return track;
+      return await runYtDlpInfo(targetQuery);
     } catch (directErr) {
       console.error(`Direct YouTube lookup blocked: ${directErr.message}`);
-      // Fallback: Fetch metadata via clean oEmbed, then search SoundCloud to bypass the block
+
+      // Bypass bot wall: Grab title with oEmbed, then fuzzy search SoundCloud
+      let oembed;
       try {
-        const oembed = await youtubeMetaViaOembed(targetQuery);
-        const search = oembed.author && !oembed.title.toLowerCase().includes(oembed.author.toLowerCase())
-          ? `${oembed.title} ${oembed.author}`
-          : oembed.title;
-        console.log(`Bypassing YouTube block by searching SoundCloud for: "${search}"`);
-        const track = await runYtDlpInfo(`scsearch1:${search}`);
-        track.title = oembed.title; // retain original video title
-        track.thumbnail = oembed.thumbnail || track.thumbnail;
-        track.note = 'Resolved via SoundCloud audio mirror.';
-        return track;
-      } catch (fallbackErr) {
-        throw new Error('YouTube blocked this datacenter IP and no fallback source was found.');
+        oembed = await youtubeMetaViaOembed(targetQuery);
+      } catch {
+        throw new Error('Unable to extract metadata from that YouTube URL.');
       }
+
+      const stripped = cleanTitle(oembed.title);
+      const attempts = [
+        oembed.title,
+        stripped,
+        `${stripped} ${oembed.author}`.trim(),
+        oembed.author,
+      ];
+
+      for (const term of attempts) {
+        if (!term) continue;
+        try {
+          const track = await runYtDlpInfo(`scsearch1:${term}`);
+          track.title = oembed.title; // Retain original track title
+          track.thumbnail = oembed.thumbnail || track.thumbnail;
+          track.note = 'Resolved via SoundCloud audio mirror.';
+          return track;
+        } catch {}
+      }
+      throw new Error('YouTube is blocked on this host, and no SoundCloud match was found.');
     }
   }
 
-  // 3. Regular URLs or Text Search Queries
+  // 3. General Queries: SoundCloud first to avoid datacenter blocks, then YouTube
   const searchTargets = isUrl(targetQuery)
     ? [targetQuery]
     : [`scsearch1:${targetQuery}`, `ytsearch1:${targetQuery}`];
@@ -287,7 +306,7 @@ function trackEmbed(title, track, extra) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Voice Connection & Audio Stream Pipeline                           */
+/* Voice Connection & High-Fidelity Audio Pipeline                     */
 /* ------------------------------------------------------------------ */
 async function createGuildQueue(interaction, voiceChannel) {
   const connection = joinVoiceChannel({
@@ -386,7 +405,7 @@ function playNext(gq, announce) {
   if (!next) {
     gq.current = null;
     gq.leaveTimer = setTimeout(() => {
-      gq.textChannel?.send('Queue finished. Leaving the voice channel.').catch(() => {});
+      gq.textChannel?.send('Queue finished. Disconnecting from voice.').catch(() => {});
       destroyQueue(gq.guildId);
     }, 120_000);
     return;
@@ -394,15 +413,24 @@ function playNext(gq, announce) {
 
   gq.current = next;
 
-  // Stream raw audio through yt-dlp
+  // 1. Fetch best available audio stream
   const ytProc = spawn(
     YTDLP_PATH,
-    ['-f', 'bestaudio/best', '-o', '-', '-q', '--no-warnings', '--no-playlist', ...ytExtraArgs, next.url],
+    [
+      '-f', 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+      '--audio-quality', '0',
+      '-o', '-',
+      '-q',
+      '--no-warnings',
+      '--no-playlist',
+      ...ytExtraArgs,
+      next.url,
+    ],
     { stdio: ['ignore', 'pipe', 'pipe'] },
   );
   gq.ytProc = ytProc;
 
-  // Transcode to 48kHz Stereo 16-bit PCM for Discord
+  // 2. High-Fidelity Transcoding with SoX 32-bit Resampler & Subtle Presence EQ
   const ffmpegBin = ffmpegPath || 'ffmpeg';
   const ffmpegProc = spawn(
     ffmpegBin,
@@ -410,6 +438,7 @@ function playNext(gq, announce) {
       '-analyzeduration', '0',
       '-loglevel', '0',
       '-i', 'pipe:0',
+      '-af', 'aresample=48000:resampler=soxr:precision=28,equalizer=f=64:t=q:w=1:g=2,equalizer=f=12000:t=q:w=1:g=1.5',
       '-f', 's16le',
       '-ar', '48000',
       '-ac', '2',
@@ -424,6 +453,7 @@ function playNext(gq, announce) {
   ytProc.on('error', (e) => console.error('yt-dlp stream error:', e.message));
   ffmpegProc.on('error', (e) => console.error('FFmpeg transcode error:', e.message));
 
+  // 3. Audio Resource Initialization
   const resource = createAudioResource(ffmpegProc.stdout, {
     inputType: StreamType.Raw,
     inlineVolume: true,
@@ -463,7 +493,7 @@ async function handlePlay(interaction) {
     track = await resolveTrack(interaction.options.getString('query', true));
   } catch (err) {
     console.error(err.message);
-    return interaction.editReply("Could not find any playable audio for that query or link.");
+    return interaction.editReply(err.message || 'Could not find any playable audio.');
   }
   track.requestedBy = interaction.member.displayName;
 
@@ -493,17 +523,17 @@ const handlers = {
   async skip(i, gq) {
     gq.forceNext = true;
     gq.player.stop(true);
-    return i.reply('Skipped.');
+    return i.reply('Skipped to the next track.');
   },
   async pause(i, gq) {
-    return i.reply(gq.player.pause() ? 'Paused.' : ephemeral('Nothing is playing.'));
+    return i.reply(gq.player.pause() ? 'Paused playback.' : ephemeral('Nothing is playing to pause.'));
   },
   async resume(i, gq) {
-    return i.reply(gq.player.unpause() ? 'Resumed.' : ephemeral('Nothing to resume.'));
+    return i.reply(gq.player.unpause() ? 'Resumed playback.' : ephemeral('Playback is not paused.'));
   },
   async stop(i, gq) {
     destroyQueue(gq.guildId);
-    return i.reply('Stopped and disconnected.');
+    return i.reply('Stopped playback, cleared the queue, and disconnected.');
   },
   async queue(i, gq) {
     if (!gq.current && !gq.queue.length) return i.reply(ephemeral('The queue is empty.'));
@@ -516,13 +546,13 @@ const handlers = {
       .setTitle('Queue')
       .setDescription(
         (gq.current ? `**Now playing:** [${gq.current.title}](${gq.current.url})\n\n` : '') +
-          (lines.length ? lines.join('\n') + more : 'Nothing up next.'),
+          (lines.length ? lines.join('\n') + more : 'No tracks queued up next.'),
       )
       .setFooter({ text: `Loop: ${gq.loop} | Volume: ${gq.volume}%` });
     return i.reply({ embeds: [embed] });
   },
   async nowplaying(i, gq) {
-    if (!gq.current) return i.reply(ephemeral('Nothing is playing.'));
+    if (!gq.current) return i.reply(ephemeral('Nothing is currently playing.'));
     const elapsed = Math.floor((gq.resource?.playbackDuration ?? 0) / 1000);
     return i.reply({
       embeds: [
@@ -535,7 +565,7 @@ const handlers = {
     });
   },
   async shuffle(i, gq) {
-    if (gq.queue.length < 2) return i.reply(ephemeral('Not enough songs in the queue to shuffle.'));
+    if (gq.queue.length < 2) return i.reply(ephemeral('At least 2 songs are needed to shuffle.'));
     for (let n = gq.queue.length - 1; n > 0; n--) {
       const k = Math.floor(Math.random() * (n + 1));
       [gq.queue[n], gq.queue[k]] = [gq.queue[k], gq.queue[n]];
@@ -545,11 +575,11 @@ const handlers = {
   async volume(i, gq) {
     gq.volume = i.options.getInteger('level', true);
     gq.resource?.volume?.setVolume(gq.volume / 100);
-    return i.reply(`Volume set to **${gq.volume}%**.`);
+    return i.reply(`Volume adjusted to **${gq.volume}%**.`);
   },
   async loop(i, gq) {
     gq.loop = i.options.getString('mode', true);
-    return i.reply(`Loop mode: **${gq.loop}**.`);
+    return i.reply(`Loop mode set to **${gq.loop}**.`);
   },
 };
 
@@ -579,7 +609,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === 'play') return await handler(interaction);
 
     const gq = queues.get(interaction.guildId);
-    if (!gq) return interaction.reply(ephemeral('Nothing is playing right now.'));
+    if (!gq) return interaction.reply(ephemeral('Nothing is currently playing.'));
     if (interaction.member.voice?.channelId !== gq.channelId) {
       return interaction.reply(ephemeral('You must be in the same voice channel to use that.'));
     }
@@ -599,7 +629,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 
   const channel = oldState.guild.channels.cache.get(gq.channelId);
   if (channel && channel.members.filter((m) => !m.user.bot).size === 0) {
-    gq.textChannel?.send('All users left. Disconnecting.').catch(() => {});
+    gq.textChannel?.send('All users left the voice channel. Disconnecting.').catch(() => {});
     destroyQueue(gq.guildId);
   }
 });
