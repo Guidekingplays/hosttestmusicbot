@@ -34,12 +34,13 @@ if (!DISCORD_TOKEN) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Optional YouTube Cookies / Proxy Configuration                     */
+/* YouTube & Network Flags                                             */
 /* ------------------------------------------------------------------ */
 const ytExtraArgs = [
-  '--extractor-args',
-  'youtube:player_client=android,web_safari;player_skip=configs',
   '--force-ipv4',
+  '--no-check-certificates',
+  '--extractor-args',
+  'youtube:player_client=tv_embedded,mweb,web_creator',
 ];
 
 if (process.env.YT_COOKIES_B64) {
@@ -57,7 +58,7 @@ if (process.env.YT_PROXY) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Discord Client Initialization                                      */
+/* Client Initialization                                              */
 /* ------------------------------------------------------------------ */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -68,14 +69,14 @@ const client = new Client({
 });
 
 /* ------------------------------------------------------------------ */
-/* Slash Command Definitions                                          */
+/* Slash Commands Definition                                          */
 /* ------------------------------------------------------------------ */
 const commands = [
   new SlashCommandBuilder()
     .setName('play')
-    .setDescription('Play a song (SoundCloud, YouTube, or Spotify link)')
+    .setDescription('Play a song from YouTube, Spotify, or SoundCloud')
     .addStringOption((o) =>
-      o.setName('query').setDescription('Song name or URL').setRequired(true),
+      o.setName('query').setDescription('Song name, YouTube URL, or Spotify link').setRequired(true),
     ),
   new SlashCommandBuilder().setName('skip').setDescription('Skip the current song'),
   new SlashCommandBuilder().setName('pause').setDescription('Pause playback'),
@@ -86,7 +87,7 @@ const commands = [
   new SlashCommandBuilder().setName('shuffle').setDescription('Shuffle the upcoming queue'),
   new SlashCommandBuilder()
     .setName('volume')
-    .setDescription('Set playback volume (1-100)')
+    .setDescription('Set volume (1-100)')
     .addIntegerOption((o) =>
       o.setName('level').setDescription('Volume 1-100').setMinValue(1).setMaxValue(100).setRequired(true),
     ),
@@ -119,7 +120,7 @@ async function registerCommands() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Track Resolvers & Metadata Helpers                                 */
+/* Helpers & Resolvers                                                */
 /* ------------------------------------------------------------------ */
 const queues = new Map();
 const isUrl = (s) => /^https?:\/\//i.test(s);
@@ -155,12 +156,9 @@ async function spotifyMetaViaOembed(url) {
     `https://open.spotify.com/oembed?url=${encodeURIComponent(cleanUrl)}`,
     { signal: AbortSignal.timeout(8000) },
   );
-  if (!res.ok) throw new Error(`Spotify oEmbed returned status ${res.status}`);
+  if (!res.ok) throw new Error(`Spotify oEmbed status ${res.status}`);
   const data = await res.json();
-  return {
-    title: data.title,
-    thumbnail: data.thumbnail_url,
-  };
+  return { title: data.title, thumbnail: data.thumbnail_url };
 }
 
 async function youtubeMetaViaOembed(url) {
@@ -173,9 +171,13 @@ async function youtubeMetaViaOembed(url) {
     `https://www.youtube.com/oembed?url=${encodeURIComponent(watch)}&format=json`,
     { signal: AbortSignal.timeout(8000) },
   );
-  if (!res.ok) throw new Error(`oEmbed returned status ${res.status}`);
+  if (!res.ok) throw new Error(`YouTube oEmbed status ${res.status}`);
   const data = await res.json();
-  return { title: data.title, author: (data.author_name || '').replace(/ - Topic$/i, '') };
+  return {
+    title: data.title,
+    author: (data.author_name || '').replace(/ - Topic$/i, ''),
+    thumbnail: data.thumbnail_url,
+  };
 }
 
 function runYtDlpInfo(target) {
@@ -189,7 +191,7 @@ function runYtDlpInfo(target) {
     let err = '';
     proc.stdout.on('data', (d) => (out += d));
     proc.stderr.on('data', (d) => (err += d));
-    proc.on('error', (e) => reject(new Error(`Could not spawn yt-dlp: ${e.message}`)));
+    proc.on('error', (e) => reject(new Error(`yt-dlp spawn failure: ${e.message}`)));
     proc.on('close', (code) => {
       const line = out.split('\n').find((l) => l.trim().startsWith('{'));
       if (code !== 0 || !line) return reject(new Error(err.trim() || 'No audio sources found'));
@@ -198,6 +200,7 @@ function runYtDlpInfo(target) {
         resolve({
           title: j.title,
           url: j.webpage_url || j.url,
+          streamUrl: j.url,
           duration: j.duration,
           thumbnail: j.thumbnail,
           author: j.uploader || j.channel,
@@ -213,47 +216,56 @@ async function resolveTrack(query) {
   let targetQuery = query;
   let customThumbnail = null;
 
-  // Intercept Spotify URLs via oEmbed
+  // 1. Handle Spotify links
   if (isUrl(query) && isSpotifyUrl(query)) {
     try {
       const meta = await spotifyMetaViaOembed(query);
       targetQuery = meta.title;
       customThumbnail = meta.thumbnail;
-      console.log(`Resolved Spotify track: "${targetQuery}"`);
     } catch (e) {
-      console.error(`Spotify resolution failed: ${e.message}`);
+      console.error(`Spotify oEmbed failed: ${e.message}`);
     }
   }
 
-  // Prioritize SoundCloud searches to avoid datacenter IP bot challenges
-  const targets = isUrl(targetQuery)
+  // 2. Handle YouTube Links directly
+  if (isUrl(targetQuery) && isYouTubeUrl(targetQuery)) {
+    // Try streaming directly first
+    try {
+      const track = await runYtDlpInfo(targetQuery);
+      return track;
+    } catch (directErr) {
+      console.error(`Direct YouTube lookup blocked: ${directErr.message}`);
+      // Fallback: Fetch metadata via clean oEmbed, then search SoundCloud to bypass the block
+      try {
+        const oembed = await youtubeMetaViaOembed(targetQuery);
+        const search = oembed.author && !oembed.title.toLowerCase().includes(oembed.author.toLowerCase())
+          ? `${oembed.title} ${oembed.author}`
+          : oembed.title;
+        console.log(`Bypassing YouTube block by searching SoundCloud for: "${search}"`);
+        const track = await runYtDlpInfo(`scsearch1:${search}`);
+        track.title = oembed.title; // retain original video title
+        track.thumbnail = oembed.thumbnail || track.thumbnail;
+        track.note = 'Resolved via SoundCloud audio mirror.';
+        return track;
+      } catch (fallbackErr) {
+        throw new Error('YouTube blocked this datacenter IP and no fallback source was found.');
+      }
+    }
+  }
+
+  // 3. Regular URLs or Text Search Queries
+  const searchTargets = isUrl(targetQuery)
     ? [targetQuery]
     : [`scsearch1:${targetQuery}`, `ytsearch1:${targetQuery}`];
 
   let lastErr;
-  for (const target of targets) {
+  for (const target of searchTargets) {
     try {
       const track = await runYtDlpInfo(target);
       if (customThumbnail) track.thumbnail = customThumbnail;
       return track;
     } catch (e) {
       lastErr = e;
-    }
-  }
-
-  // YouTube fallback via SoundCloud if IP blocked
-  if (isUrl(targetQuery) && isYouTubeUrl(targetQuery)) {
-    try {
-      const { title, author } = await youtubeMetaViaOembed(targetQuery);
-      const search = author && !title.toLowerCase().includes(author.toLowerCase())
-        ? `${title} ${author}`
-        : title;
-      const track = await runYtDlpInfo(`scsearch1:${search}`);
-      track.note = 'Resolved via SoundCloud mirror.';
-      if (customThumbnail) track.thumbnail = customThumbnail;
-      return track;
-    } catch (e) {
-      console.error(`Fallback failed: ${e.message}`);
     }
   }
 
@@ -275,7 +287,7 @@ function trackEmbed(title, track, extra) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Voice Connection & Audio Playback Pipeline                         */
+/* Voice Connection & Audio Stream Pipeline                           */
 /* ------------------------------------------------------------------ */
 async function createGuildQueue(interaction, voiceChannel) {
   const connection = joinVoiceChannel({
@@ -374,7 +386,7 @@ function playNext(gq, announce) {
   if (!next) {
     gq.current = null;
     gq.leaveTimer = setTimeout(() => {
-      gq.textChannel?.send('Queue finished. Disconnecting from voice.').catch(() => {});
+      gq.textChannel?.send('Queue finished. Leaving the voice channel.').catch(() => {});
       destroyQueue(gq.guildId);
     }, 120_000);
     return;
@@ -382,7 +394,7 @@ function playNext(gq, announce) {
 
   gq.current = next;
 
-  // 1. Fetch raw media stream using yt-dlp
+  // Stream raw audio through yt-dlp
   const ytProc = spawn(
     YTDLP_PATH,
     ['-f', 'bestaudio/best', '-o', '-', '-q', '--no-warnings', '--no-playlist', ...ytExtraArgs, next.url],
@@ -390,7 +402,7 @@ function playNext(gq, announce) {
   );
   gq.ytProc = ytProc;
 
-  // 2. Transcode into raw 48kHz Stereo 16-bit PCM for Discord Voice
+  // Transcode to 48kHz Stereo 16-bit PCM for Discord
   const ffmpegBin = ffmpegPath || 'ffmpeg';
   const ffmpegProc = spawn(
     ffmpegBin,
@@ -412,7 +424,6 @@ function playNext(gq, announce) {
   ytProc.on('error', (e) => console.error('yt-dlp stream error:', e.message));
   ffmpegProc.on('error', (e) => console.error('FFmpeg transcode error:', e.message));
 
-  // 3. Create Audio Resource
   const resource = createAudioResource(ffmpegProc.stdout, {
     inputType: StreamType.Raw,
     inlineVolume: true,
@@ -442,7 +453,7 @@ async function handlePlay(interaction) {
 
   let gq = queues.get(interaction.guildId);
   if (gq && gq.channelId !== voiceChannel.id) {
-    return interaction.reply(ephemeral("I'm active in a different voice channel in this server."));
+    return interaction.reply(ephemeral("I'm already playing in another voice channel."));
   }
 
   await interaction.deferReply();
@@ -482,17 +493,17 @@ const handlers = {
   async skip(i, gq) {
     gq.forceNext = true;
     gq.player.stop(true);
-    return i.reply('Skipped to next song.');
+    return i.reply('Skipped.');
   },
   async pause(i, gq) {
-    return i.reply(gq.player.pause() ? 'Paused playback.' : ephemeral('Nothing is playing to pause.'));
+    return i.reply(gq.player.pause() ? 'Paused.' : ephemeral('Nothing is playing.'));
   },
   async resume(i, gq) {
-    return i.reply(gq.player.unpause() ? 'Resumed playback.' : ephemeral('Playback is not paused.'));
+    return i.reply(gq.player.unpause() ? 'Resumed.' : ephemeral('Nothing to resume.'));
   },
   async stop(i, gq) {
     destroyQueue(gq.guildId);
-    return i.reply('Stopped playback, cleared the queue, and disconnected.');
+    return i.reply('Stopped and disconnected.');
   },
   async queue(i, gq) {
     if (!gq.current && !gq.queue.length) return i.reply(ephemeral('The queue is empty.'));
@@ -505,13 +516,13 @@ const handlers = {
       .setTitle('Queue')
       .setDescription(
         (gq.current ? `**Now playing:** [${gq.current.title}](${gq.current.url})\n\n` : '') +
-          (lines.length ? lines.join('\n') + more : 'No tracks queued up next.'),
+          (lines.length ? lines.join('\n') + more : 'Nothing up next.'),
       )
       .setFooter({ text: `Loop: ${gq.loop} | Volume: ${gq.volume}%` });
     return i.reply({ embeds: [embed] });
   },
   async nowplaying(i, gq) {
-    if (!gq.current) return i.reply(ephemeral('Nothing is currently playing.'));
+    if (!gq.current) return i.reply(ephemeral('Nothing is playing.'));
     const elapsed = Math.floor((gq.resource?.playbackDuration ?? 0) / 1000);
     return i.reply({
       embeds: [
@@ -524,7 +535,7 @@ const handlers = {
     });
   },
   async shuffle(i, gq) {
-    if (gq.queue.length < 2) return i.reply(ephemeral('At least 2 songs are needed to shuffle.'));
+    if (gq.queue.length < 2) return i.reply(ephemeral('Not enough songs in the queue to shuffle.'));
     for (let n = gq.queue.length - 1; n > 0; n--) {
       const k = Math.floor(Math.random() * (n + 1));
       [gq.queue[n], gq.queue[k]] = [gq.queue[k], gq.queue[n]];
@@ -534,16 +545,16 @@ const handlers = {
   async volume(i, gq) {
     gq.volume = i.options.getInteger('level', true);
     gq.resource?.volume?.setVolume(gq.volume / 100);
-    return i.reply(`Volume adjusted to **${gq.volume}%**.`);
+    return i.reply(`Volume set to **${gq.volume}%**.`);
   },
   async loop(i, gq) {
     gq.loop = i.options.getString('mode', true);
-    return i.reply(`Loop mode set to **${gq.loop}**.`);
+    return i.reply(`Loop mode: **${gq.loop}**.`);
   },
 };
 
 /* ------------------------------------------------------------------ */
-/* Discord Gateway Event Listeners                                    */
+/* Events                                                             */
 /* ------------------------------------------------------------------ */
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -568,7 +579,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === 'play') return await handler(interaction);
 
     const gq = queues.get(interaction.guildId);
-    if (!gq) return interaction.reply(ephemeral('Nothing is currently playing.'));
+    if (!gq) return interaction.reply(ephemeral('Nothing is playing right now.'));
     if (interaction.member.voice?.channelId !== gq.channelId) {
       return interaction.reply(ephemeral('You must be in the same voice channel to use that.'));
     }
@@ -588,7 +599,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 
   const channel = oldState.guild.channels.cache.get(gq.channelId);
   if (channel && channel.members.filter((m) => !m.user.bot).size === 0) {
-    gq.textChannel?.send('All users left the voice channel. Disconnecting.').catch(() => {});
+    gq.textChannel?.send('All users left. Disconnecting.').catch(() => {});
     destroyQueue(gq.guildId);
   }
 });
@@ -596,7 +607,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
 
 /* ------------------------------------------------------------------ */
-/* Render Keep-Alive HTTP Server & Client Login                       */
+/* Render Keep-Alive Port Listener                                    */
 /* ------------------------------------------------------------------ */
 http
   .createServer((req, res) => {
